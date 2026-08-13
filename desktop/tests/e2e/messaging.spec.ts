@@ -998,7 +998,10 @@ test("async metadata beyond old cutoff still produces preview image", async ({
   await input.press("Enter");
 
   const progress = page.getByTestId("composer-upload-progress");
+  const diagnostics = page.getByTestId("link-preview-debug-overlay");
   await expect(progress).toHaveAccessibleName("Preparing link preview");
+  await expect(diagnostics).toContainText("post-submit");
+  await expect(diagnostics).toContainText("meta:pending");
   await page.waitForTimeout(3_200);
   await expect(progress).toBeVisible();
 

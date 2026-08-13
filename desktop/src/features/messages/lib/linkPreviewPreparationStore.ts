@@ -13,6 +13,7 @@ import {
 
 const POST_SUBMIT_PREVIEW_BUDGET_MS = 10_000;
 const SETTLED_PREVIEW_JOB_TTL_MS = 5 * 60_000;
+const MAX_DIAGNOSTIC_JOBS = 8;
 
 type PreviewJob = {
   promise: Promise<string[] | null>;
@@ -27,8 +28,37 @@ type BackgroundPreviewTask = {
   skip: () => void;
 };
 
+type DiagnosticStage =
+  | "metadata"
+  | "metadata-ready"
+  | "uploading-media"
+  | "resolved"
+  | "failed";
+type DiagnosticMediaOutcome =
+  | "pending"
+  | "not-provided"
+  | "invalid-data-url"
+  | "uploaded"
+  | "upload-failed";
+type DiagnosticTerminalReason = "complete" | "timeout" | "skip";
+
+export type LinkPreviewDiagnostic = {
+  href: string;
+  startedAt: number;
+  updatedAt: number;
+  stage: DiagnosticStage;
+  metadata: "pending" | "ready" | "missing" | "invalid" | "failed";
+  image: DiagnosticMediaOutcome;
+  favicon: DiagnosticMediaOutcome;
+  result: "pending" | "resolved" | "fallback" | "failed";
+  mode: "pre-submit" | "post-submit";
+  terminalAt: number | null;
+  terminalReason: DiagnosticTerminalReason | null;
+};
+
 type BackgroundPreviewSnapshot = {
   canSkip: boolean;
+  diagnostics: readonly LinkPreviewDiagnostic[];
   isPreparing: boolean;
 };
 
@@ -38,24 +68,60 @@ export type PreparedBackgroundLinkPreviews = {
 };
 
 const jobs = new Map<string, PreviewJob>();
+const diagnostics = new Map<string, LinkPreviewDiagnostic>();
 const tasks = new Map<number, BackgroundPreviewTask>();
 const listeners = new Set<() => void>();
 let nextTaskId = 0;
 let snapshot: BackgroundPreviewSnapshot = {
   canSkip: false,
+  diagnostics: [],
   isPreparing: false,
 };
 
 function publishSnapshot(): void {
+  const now = Date.now();
+  for (const [href, diagnostic] of diagnostics) {
+    if (now - diagnostic.updatedAt >= SETTLED_PREVIEW_JOB_TTL_MS) {
+      diagnostics.delete(href);
+    }
+  }
+  const recentDiagnostics = [...diagnostics.values()].sort(
+    (left, right) => right.updatedAt - left.updatedAt,
+  );
+  for (const diagnostic of recentDiagnostics.slice(MAX_DIAGNOSTIC_JOBS)) {
+    diagnostics.delete(diagnostic.href);
+  }
   snapshot = {
     canSkip: tasks.size > 0,
+    diagnostics: recentDiagnostics.slice(0, MAX_DIAGNOSTIC_JOBS),
     isPreparing: tasks.size > 0,
   };
   for (const listener of listeners) listener();
 }
 
-function dataUrlBytes(dataUrl: string | null | undefined): Uint8Array | null {
-  if (!dataUrl) return null;
+function updateDiagnostic(
+  href: string,
+  update: Partial<Omit<LinkPreviewDiagnostic, "href" | "startedAt">>,
+): void {
+  const now = Date.now();
+  const current = diagnostics.get(href) ?? {
+    href,
+    startedAt: now,
+    updatedAt: now,
+    stage: "metadata" as const,
+    metadata: "pending" as const,
+    image: "pending" as const,
+    favicon: "pending" as const,
+    result: "pending" as const,
+    mode: "pre-submit" as const,
+    terminalAt: null,
+    terminalReason: null,
+  };
+  diagnostics.set(href, { ...current, ...update, updatedAt: now });
+  publishSnapshot();
+}
+
+function dataUrlBytes(dataUrl: string): Uint8Array | null {
   const comma = dataUrl.indexOf(",");
   if (comma < 0) return null;
   try {
@@ -66,17 +132,49 @@ function dataUrlBytes(dataUrl: string | null | undefined): Uint8Array | null {
   }
 }
 
+type UploadResult = {
+  failed: boolean;
+  outcome: Exclude<DiagnosticMediaOutcome, "pending">;
+  sha256: string;
+  url: string;
+};
+
 async function uploadDataUrl(
   dataUrl: string | null | undefined,
   filename: string,
-): Promise<{ failed: boolean; sha256: string; url: string }> {
+): Promise<UploadResult> {
+  if (!dataUrl) {
+    return {
+      failed: false,
+      outcome: "not-provided",
+      sha256: "",
+      url: "",
+    };
+  }
   const bytes = dataUrlBytes(dataUrl);
-  if (!bytes) return { failed: false, sha256: "", url: "" };
+  if (!bytes) {
+    return {
+      failed: false,
+      outcome: "invalid-data-url",
+      sha256: "",
+      url: "",
+    };
+  }
   try {
     const uploaded = await uploadMediaBytes([...bytes], filename);
-    return { failed: false, sha256: uploaded.sha256, url: uploaded.url };
+    return {
+      failed: false,
+      outcome: "uploaded",
+      sha256: uploaded.sha256,
+      url: uploaded.url,
+    };
   } catch {
-    return { failed: true, sha256: "", url: "" };
+    return {
+      failed: true,
+      outcome: "upload-failed",
+      sha256: "",
+      url: "",
+    };
   }
 }
 
@@ -84,10 +182,38 @@ async function buildSnapshot(
   candidate: SupportedLinkPreview,
   onMetadataReady: (tag: string[]) => void,
 ): Promise<string[] | null> {
-  const metadata = await loadLinkPreviewMetadata(candidate.href);
-  if (!metadata) return null;
+  let metadata: Awaited<ReturnType<typeof loadLinkPreviewMetadata>>;
+  try {
+    metadata = await loadLinkPreviewMetadata(candidate.href);
+  } catch (error) {
+    updateDiagnostic(candidate.href, {
+      metadata: "failed",
+      result: "failed",
+      stage: "failed",
+    });
+    throw error;
+  }
+  if (!metadata) {
+    updateDiagnostic(candidate.href, {
+      metadata: "missing",
+      result: "failed",
+      stage: "failed",
+    });
+    return null;
+  }
   const preview = resolveLinkPreview(candidate, metadata);
-  if (!preview.snapshotReady) return null;
+  if (!preview.snapshotReady) {
+    updateDiagnostic(candidate.href, {
+      metadata: "invalid",
+      result: "failed",
+      stage: "failed",
+    });
+    return null;
+  }
+  updateDiagnostic(candidate.href, {
+    metadata: "ready",
+    stage: "metadata-ready",
+  });
   const fallbackTag = buildLinkPreviewSnapshotTag({
     canonicalUrl: preview.href,
     title: preview.title,
@@ -98,13 +224,24 @@ async function buildSnapshot(
     faviconUrl: "",
     faviconSha256: "",
   });
-  if (!fallbackTag) return null;
+  if (!fallbackTag) {
+    updateDiagnostic(candidate.href, { result: "failed", stage: "failed" });
+    return null;
+  }
   onMetadataReady(fallbackTag);
+  updateDiagnostic(candidate.href, { stage: "uploading-media" });
   const [image, favicon] = await Promise.all([
     uploadDataUrl(preview.imageDataUrl, "link-preview-image.png"),
     uploadDataUrl(preview.faviconDataUrl, "link-preview-favicon.png"),
   ]);
-  if (image.failed || favicon.failed) return fallbackTag;
+  const uploadFailed = image.failed || favicon.failed;
+  updateDiagnostic(candidate.href, {
+    favicon: favicon.outcome,
+    image: image.outcome,
+    result: uploadFailed ? "fallback" : "resolved",
+    stage: uploadFailed ? "failed" : "resolved",
+  });
+  if (uploadFailed) return fallbackTag;
   return (
     buildLinkPreviewSnapshotTag({
       canonicalUrl: preview.href,
@@ -142,6 +279,15 @@ export function prepareLinkPreview(
   }
   if (existing) jobs.delete(candidate.href);
 
+  updateDiagnostic(candidate.href, {
+    favicon: "pending",
+    image: "pending",
+    metadata: "pending",
+    result: "pending",
+    stage: "metadata",
+    terminalAt: null,
+    terminalReason: null,
+  });
   const job: PreviewJob = {
     promise: Promise.resolve(null),
     fallbackTag: null,
@@ -163,6 +309,14 @@ export function prepareLinkPreview(
     .finally(() => {
       job.settled = true;
       job.settledAt = Date.now();
+      const diagnostic = diagnostics.get(candidate.href);
+      updateDiagnostic(candidate.href, {
+        result:
+          diagnostic?.result === "pending" ? "failed" : diagnostic?.result,
+        stage: diagnostic?.stage === "metadata" ? "failed" : diagnostic?.stage,
+        terminalAt: diagnostic?.terminalAt ?? Date.now(),
+        terminalReason: diagnostic?.terminalReason ?? "complete",
+      });
     });
   jobs.set(candidate.href, job);
   return job.promise;
@@ -183,11 +337,20 @@ export function prepareBackgroundLinkPreviews(
       isValidLinkPreviewSnapshotCanonicalUrl(candidate.href),
   );
   if (external.length === 0) return null;
+  for (const candidate of external) {
+    updateDiagnostic(candidate.href, { mode: "post-submit" });
+  }
 
   const pending = external.some(
     (candidate) => !jobs.get(candidate.href)?.settled,
   );
   if (!pending) {
+    for (const candidate of external) {
+      updateDiagnostic(candidate.href, {
+        terminalAt: Date.now(),
+        terminalReason: "complete",
+      });
+    }
     return {
       promise: Promise.all(external.map(prepareLinkPreview)).then((tags) =>
         tags.filter((tag): tag is string[] => tag !== null),
@@ -206,24 +369,36 @@ export function prepareBackgroundLinkPreviews(
   let finish: ((tags: string[][]) => void) | null = null;
   let terminal = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
-  const complete = (tags: string[][]) => {
+  const complete = (
+    tags: string[][],
+    terminalReason: DiagnosticTerminalReason,
+  ) => {
     if (terminal) return;
     terminal = true;
     if (timer !== null) clearTimeout(timer);
     tasks.delete(taskId);
+    for (const candidate of external) {
+      updateDiagnostic(candidate.href, {
+        terminalAt: Date.now(),
+        terminalReason,
+      });
+    }
     publishSnapshot();
     finish?.(tags);
   };
   const promise = new Promise<string[][]>((resolve) => {
     finish = resolve;
   });
-  const skip = () => complete([]);
+  const skip = () => complete([], "skip");
   tasks.set(taskId, { id: taskId, skip });
   publishSnapshot();
 
-  timer = setTimeout(() => complete(availableTags()), timeoutMs);
+  timer = setTimeout(() => complete(availableTags(), "timeout"), timeoutMs);
   void Promise.all(external.map(prepareLinkPreview)).then((tags) => {
-    complete(tags.filter((tag): tag is string[] => tag !== null));
+    complete(
+      tags.filter((tag): tag is string[] => tag !== null),
+      "complete",
+    );
   });
 
   return { promise, skip };
@@ -233,9 +408,16 @@ export function skipBackgroundLinkPreviews(): void {
   for (const task of [...tasks.values()]) task.skip();
 }
 
+export function clearLinkPreviewDiagnostics(): void {
+  diagnostics.clear();
+  publishSnapshot();
+}
+
 export function resetLinkPreviewPreparations(): void {
   for (const task of [...tasks.values()]) task.skip();
   jobs.clear();
+  diagnostics.clear();
+  publishSnapshot();
 }
 
 function subscribe(listener: () => void): () => void {
@@ -252,6 +434,7 @@ export function useBackgroundLinkPreviewPreparation(): BackgroundPreviewSnapshot
 }
 
 export const __linkPreviewPreparationTest = {
+  diagnostics,
   isReusableJob,
   jobs,
   reset: resetLinkPreviewPreparations,

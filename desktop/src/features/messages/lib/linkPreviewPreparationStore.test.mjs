@@ -140,6 +140,14 @@ test("timeout keeps metadata-only fallback and ignores late upload completion", 
   const preparation = prepareBackgroundLinkPreviews([first], 0);
   assert.ok(preparation);
   assert.deepEqual(await preparation.promise, [fallbackTag]);
+  assert.deepEqual(
+    {
+      mode: __linkPreviewPreparationTest.diagnostics.get(first.href)?.mode,
+      terminalReason: __linkPreviewPreparationTest.diagnostics.get(first.href)
+        ?.terminalReason,
+    },
+    { mode: "post-submit", terminalReason: "timeout" },
+  );
 
   pending.resolve(firstTag);
   await pending.promise;
@@ -153,6 +161,10 @@ test("Skip wins completion and resolves exactly once", async () => {
   const preparation = prepareBackgroundLinkPreviews([first], 1_000);
   assert.ok(preparation);
   preparation.skip();
+  assert.equal(
+    __linkPreviewPreparationTest.diagnostics.get(first.href)?.terminalReason,
+    "skip",
+  );
   pending.resolve(firstTag);
 
   assert.deepEqual(await preparation.promise, []);
