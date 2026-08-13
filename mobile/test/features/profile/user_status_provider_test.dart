@@ -100,6 +100,71 @@ void main() {
 
     expect(container.read(userStatusCacheProvider)['alice'], isNull);
   });
+
+  test('ignores an out-of-range expiration in the shared cache scheduler', () {
+    final container = ProviderContainer(
+      overrides: [
+        relayClientProvider.overrideWithValue(
+          RelayClient(baseUrl: 'https://relay.example'),
+        ),
+        relaySessionProvider.overrideWith(_DisconnectedRelaySession.new),
+      ],
+    );
+    addTearDown(container.dispose);
+
+    final status = UserStatus(
+      text: 'Focusing',
+      emoji: '',
+      updatedAt: 1,
+      expiresAt: 9_000_000_000_000,
+    );
+    expect(status.expirationDateTime, isNull);
+
+    expect(
+      () => container
+          .read(userStatusCacheProvider.notifier)
+          .updateStatus('alice', status),
+      returnsNormally,
+    );
+    expect(container.read(userStatusCacheProvider)['alice'], same(status));
+  });
+
+  test(
+    'ignores an out-of-range expiration in the current-user scheduler',
+    () async {
+      final keys = nostr.Keys.generate();
+      final relaySession = _StatusRelaySession(
+        NostrEvent(
+          id: 'status-1',
+          pubkey: keys.public,
+          createdAt: 1,
+          kind: EventKind.userStatus,
+          tags: const [
+            ['d', 'general'],
+            ['expiration', '9000000000000'],
+          ],
+          content: 'Focusing',
+          sig: 'sig',
+        ),
+      );
+      final container = ProviderContainer(
+        overrides: [
+          relayConfigProvider.overrideWith(
+            () => _FixedRelayConfigNotifier(keys.nsec),
+          ),
+          relaySessionProvider.overrideWith(() => relaySession),
+          userStatusCacheProvider.overrideWith(_EmptyUserStatusCache.new),
+        ],
+      );
+      addTearDown(container.dispose);
+
+      final status = await container.read(userStatusProvider.future);
+
+      expect(status?.text, 'Focusing');
+      expect(status?.expiresAt, 9_000_000_000_000);
+      expect(status?.expirationDateTime, isNull);
+    },
+  );
 }
 
 class _FixedRelayConfigNotifier extends RelayConfigNotifier {
@@ -132,6 +197,18 @@ class _RecordingRelaySession extends RelaySessionNotifier {
     published.add(event);
     return event;
   }
+}
+
+class _StatusRelaySession extends _RecordingRelaySession {
+  _StatusRelaySession(this.status);
+
+  final NostrEvent status;
+
+  @override
+  Future<List<NostrEvent>> fetchHistory(
+    NostrFilter filter, {
+    Duration timeout = const Duration(seconds: 8),
+  }) async => [status];
 }
 
 class _DisconnectedRelaySession extends RelaySessionNotifier {

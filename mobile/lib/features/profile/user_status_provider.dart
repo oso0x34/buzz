@@ -130,10 +130,9 @@ class UserStatusNotifier extends AsyncNotifier<UserStatus?> {
   void _scheduleExpiration(UserStatus? status) {
     _expirationTimer?.cancel();
     _expirationTimer = null;
-    final expiresAt = status?.expiresAt;
-    if (expiresAt == null) return;
+    final deadline = status?.expirationDateTime;
+    if (deadline == null) return;
 
-    final deadline = DateTime.fromMillisecondsSinceEpoch(expiresAt * 1000);
     final remaining = deadline.difference(DateTime.now());
     _expirationTimer = Timer(
       remaining.isNegative ? Duration.zero : remaining,

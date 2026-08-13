@@ -120,6 +120,38 @@ void main() {
     );
   });
 
+  testWidgets('opens with an out-of-range remote expiration', (tester) async {
+    await tester.pumpWidget(
+      WidgetHelpers.testable(
+        overrides: [
+          customEmojiListProvider.overrideWithValue(const []),
+          userStatusProvider.overrideWith(() => _RecordingUserStatusNotifier()),
+        ],
+        child: Builder(
+          builder: (context) => FilledButton(
+            onPressed: () => showSetStatusSheet(
+              context,
+              currentStatus: const UserStatus(
+                text: 'Focusing',
+                emoji: '',
+                updatedAt: 1,
+                expiresAt: 9_000_000_000_000,
+              ),
+            ),
+            child: const Text('Open status editor'),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Open status editor'));
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('Focusing'), findsOneWidget);
+    expect(find.text('1 day'), findsOneWidget);
+  });
+
   testWidgets('clamps an existing custom date to the Android picker range', (
     tester,
   ) async {

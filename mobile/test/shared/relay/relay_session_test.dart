@@ -142,6 +142,54 @@ void main() {
     expect(clients.last.closed, isFalse);
   });
 
+  test(
+    'queryRelay defers closing a timed-out client until peer queries finish',
+    () async {
+      final clients = <_QueuedControlledHttpClient>[];
+      final session = RelaySessionNotifier(
+        httpClientFactory: () {
+          final client = _QueuedControlledHttpClient();
+          clients.add(client);
+          return client;
+        },
+      );
+      final container = ProviderContainer(
+        overrides: [
+          relaySessionProvider.overrideWith(() => session),
+          relayConfigProvider.overrideWith(
+            () => _FakeRelayConfigNotifier(
+              baseUrl: 'https://relay.example',
+              nsec: nostr.Keys.generate().nsec,
+            ),
+          ),
+        ],
+      );
+      addTearDown(container.dispose);
+      container.read(relaySessionProvider);
+      await Future<void>.delayed(Duration.zero);
+
+      final timedOutQuery = session.queryRelay(
+        const [],
+        timeout: const Duration(milliseconds: 10),
+      );
+      final peerQuery = session.queryRelay(const []);
+      expect(clients.single.requestCount, 2);
+
+      await expectLater(timedOutQuery, throwsA(isA<TimeoutException>()));
+      expect(clients.single.closed, isFalse);
+
+      final nextQuery = session.queryRelay(const []);
+      expect(clients, hasLength(2));
+      clients.first.complete(1, http.Response('[]', 200));
+      expect(await peerQuery, isEmpty);
+      expect(clients.first.closed, isTrue);
+
+      clients.last.complete(0, http.Response('[]', 200));
+      expect(await nextQuery, isEmpty);
+      expect(clients.last.closed, isFalse);
+    },
+  );
+
   test('queryRelay arms the rate-limit gate from a 429 retry hint', () async {
     final gateTimers = <_ManualTimer>[];
     final gate = RelayRateLimitGate(
@@ -1255,6 +1303,35 @@ class _ControlledHttpClient extends http.BaseClient {
 
   void complete(http.Response response) {
     _response.complete(
+      http.StreamedResponse(
+        Stream.value(response.bodyBytes),
+        response.statusCode,
+        headers: response.headers,
+        reasonPhrase: response.reasonPhrase,
+        request: response.request,
+      ),
+    );
+  }
+
+  @override
+  void close() => closed = true;
+}
+
+class _QueuedControlledHttpClient extends http.BaseClient {
+  final List<Completer<http.StreamedResponse>> _responses = [];
+  bool closed = false;
+
+  int get requestCount => _responses.length;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) {
+    final response = Completer<http.StreamedResponse>();
+    _responses.add(response);
+    return response.future;
+  }
+
+  void complete(int requestIndex, http.Response response) {
+    _responses[requestIndex].complete(
       http.StreamedResponse(
         Stream.value(response.bodyBytes),
         response.statusCode,

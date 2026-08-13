@@ -64,17 +64,14 @@ class _SetStatusSheet extends HookConsumerWidget {
     );
     final emoji = useState(currentStatus?.emoji ?? '');
     final text = useState(currentStatus?.text ?? '');
+    final currentExpiration = currentStatus?.expirationDateTime;
     final duration = useState(
-      currentStatus?.expiresAt == null
+      currentExpiration == null
           ? _StatusDuration.oneDay
           : _StatusDuration.custom,
     );
     final customUntil = useState(
-      currentStatus?.expiresAt == null
-          ? DateTime.now().add(_StatusDuration.oneDay.duration!)
-          : DateTime.fromMillisecondsSinceEpoch(
-              currentStatus!.expiresAt! * 1000,
-            ),
+      currentExpiration ?? DateTime.now().add(_StatusDuration.oneDay.duration!),
     );
     final isSaving = useState(false);
 

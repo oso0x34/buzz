@@ -198,18 +198,17 @@ class UserStatusCacheNotifier extends Notifier<Map<String, UserStatus?>> {
     _expirationTimer?.cancel();
     _expirationTimer = null;
 
-    int? nextExpiration;
+    DateTime? nextDeadline;
     for (final status in state.values) {
-      final expiresAt = status?.expiresAt;
-      if (expiresAt == null) continue;
-      if (nextExpiration == null || expiresAt < nextExpiration) {
-        nextExpiration = expiresAt;
+      final deadline = status?.expirationDateTime;
+      if (deadline == null) continue;
+      if (nextDeadline == null || deadline.isBefore(nextDeadline)) {
+        nextDeadline = deadline;
       }
     }
-    if (nextExpiration == null) return;
+    if (nextDeadline == null) return;
 
-    final deadline = DateTime.fromMillisecondsSinceEpoch(nextExpiration * 1000);
-    final remaining = deadline.difference(DateTime.now());
+    final remaining = nextDeadline.difference(DateTime.now());
     _expirationTimer = Timer(
       remaining.isNegative ? Duration.zero : remaining,
       _expireDueStatuses,
