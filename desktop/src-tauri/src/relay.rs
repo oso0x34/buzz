@@ -242,6 +242,13 @@ fn extract_retry_in_hint(body: &str) -> Option<u64> {
 }
 
 pub async fn relay_error_message(response: reqwest::Response) -> String {
+    relay_error_message_for(response, crate::relay_admission::WORKSPACE_PRINCIPAL).await
+}
+
+pub(crate) async fn relay_error_message_for(
+    response: reqwest::Response,
+    principal: &str,
+) -> String {
     let status = response.status();
 
     // Check for intercepted/proxy responses before reading the body.
@@ -274,7 +281,7 @@ pub async fn relay_error_message(response: reqwest::Response) -> String {
         // must see the same capped value — a single policy point prevents the TS
         // gate from receiving an uncapped hint from an untrusted relay.
         let capped_hint = hint.map(|s| s.min(crate::relay_admission::MAX_HINT_SECONDS));
-        crate::relay_admission::activate_rate_limit(capped_hint);
+        crate::relay_admission::activate_rate_limit_for(principal, capped_hint);
         if let Some(secs) = capped_hint {
             return format!("relay rate-limited: retry in {secs}s");
         }
@@ -347,7 +354,8 @@ pub async fn query_relay_at_with_keys(
     keys: &Keys,
     auth_tag: Option<&str>,
 ) -> Result<Vec<nostr::Event>, String> {
-    crate::relay_admission::wait_for_rate_limit().await;
+    let principal = keys.public_key().to_hex();
+    crate::relay_admission::wait_for_rate_limit_for(&principal).await;
     let url = format!("{}/query", api_base_url);
     let body_bytes =
         serde_json::to_vec(filters).map_err(|e| format!("filter serialization failed: {e}"))?;
@@ -366,7 +374,7 @@ pub async fn query_relay_at_with_keys(
         .await
         .map_err(|e| classify_request_error(&e))?;
     if !response.status().is_success() {
-        return Err(relay_error_message(response).await);
+        return Err(relay_error_message_for(response, &principal).await);
     }
     parse_json_response(response).await
 }
@@ -445,7 +453,8 @@ pub async fn sync_managed_agent_profile(
     avatar_url: Option<&str>,
     auth_tag: Option<&str>, // NIP-OA auth tag JSON
 ) -> Result<(), String> {
-    crate::relay_admission::wait_for_rate_limit().await;
+    let principal = agent_keys.public_key().to_hex();
+    crate::relay_admission::wait_for_rate_limit_for(&principal).await;
     // Build a signed kind:0 profile event (with optional NIP-OA auth tag).
     let event = build_profile_event(agent_keys, display_name, avatar_url, auth_tag)?;
     let event_json = event.as_json();
@@ -470,7 +479,7 @@ pub async fn sync_managed_agent_profile(
         .map_err(|e| classify_request_error(&e))?;
 
     if !response.status().is_success() {
-        let msg = relay_error_message(response).await;
+        let msg = relay_error_message_for(response, &principal).await;
         return Err(format!(
             "Could not sync the agent's profile metadata: {msg}"
         ));
@@ -564,7 +573,8 @@ pub async fn submit_signed_event_with_keys(
     if event.pubkey != keys.public_key() {
         return Err("signed event does not match the publishing identity".to_string());
     }
-    crate::relay_admission::wait_for_rate_limit().await;
+    let principal = keys.public_key().to_hex();
+    crate::relay_admission::wait_for_rate_limit_for(&principal).await;
     let url = format!("{}/events", relay_api_base_url_with_override(state));
     let body_bytes = event.as_json().into_bytes();
     crate::egress_guard::assert_no_key_backup_bytes(&body_bytes, "signed event submit (keys)")?;
@@ -586,7 +596,7 @@ pub async fn submit_signed_event_with_keys(
         .map_err(|e| classify_request_error(&e))?;
 
     if !response.status().is_success() {
-        return Err(relay_error_message(response).await);
+        return Err(relay_error_message_for(response, &principal).await);
     }
 
     let result: SubmitEventResponse = parse_json_response(response).await?;
@@ -646,7 +656,7 @@ mod tests {
     // ── relay_error_message: hint capping ────────────────────────────────────
     //
     // Verify that an oversized relay hint is capped in the returned message
-    // string, not just inside `activate_rate_limit()`. This guarantees every
+    // string, not just inside `activate_rate_limit_for()`. This guarantees every
     // consumer — including the TS gate via `applyTauriRateLimitIfNeeded` —
     // receives the capped value rather than the raw untrusted relay value.
 

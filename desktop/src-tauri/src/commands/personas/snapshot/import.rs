@@ -815,7 +815,8 @@ pub(crate) async fn submit_engram_event(
     // Wait before signing: the relay enforces NIP-98 freshness (±60s) and the
     // gate may hold for up to MAX_HINT_SECONDS (300s). Building auth before the
     // wait produces a stale `created_at` that the relay will reject.
-    crate::relay_admission::wait_for_rate_limit().await;
+    let principal = agent_keys.public_key().to_hex();
+    crate::relay_admission::wait_for_rate_limit_for(&principal).await;
     let auth = build_nip98_auth_header_for_keys(agent_keys, &Method::POST, url, event_json)?;
     let mut request = state
         .http_client
@@ -832,7 +833,7 @@ pub(crate) async fn submit_engram_event(
         .map_err(|e| crate::relay::classify_request_error(&e))?;
 
     if !response.status().is_success() {
-        let msg = crate::relay::relay_error_message(response).await;
+        let msg = crate::relay::relay_error_message_for(response, &principal).await;
         return Err(format!("relay rejected engram: {msg}"));
     }
 

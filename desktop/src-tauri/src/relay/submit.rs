@@ -22,7 +22,8 @@ pub async fn submit_signed_event_at_with_keys(
     if event.pubkey != keys.public_key() {
         return Err("signed event does not match the publishing identity".to_string());
     }
-    crate::relay_admission::wait_for_rate_limit().await;
+    let principal = keys.public_key().to_hex();
+    crate::relay_admission::wait_for_rate_limit_for(&principal).await;
     let url = format!("{}/events", api_base_url.trim_end_matches('/'));
     let body_bytes = event.as_json().into_bytes();
     crate::egress_guard::assert_no_key_backup_bytes(&body_bytes, "relay event submit")?;
@@ -39,7 +40,7 @@ pub async fn submit_signed_event_at_with_keys(
         .map_err(|e| classify_request_error(&e))?;
 
     if !response.status().is_success() {
-        return Err(relay_error_message(response).await);
+        return Err(super::relay_error_message_for(response, &principal).await);
     }
 
     let result: SubmitEventResponse = parse_json_response(response).await?;
